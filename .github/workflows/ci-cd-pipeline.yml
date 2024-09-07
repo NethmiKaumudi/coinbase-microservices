@@ -1,0 +1,90 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Log in to Docker Hub
+      run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+    - name: Build and push Docker images
+      run: |
+        services=("api-gateway" "trading-service" "wallet-service" "account-service" "notification-service")
+        for service in "${services[@]}"; do
+          docker build -t your-dockerhub-username/$service:latest ./$service
+          docker push your-dockerhub-username/$service:latest
+        done
+
+    - name: Set up Kubernetes CLI
+      uses: azure/setup-kubectl@v1
+      with:
+        version: '1.22.0'
+
+    - name: Deploy to Green Environment
+      env:
+        KUBECONFIG: ${{ secrets.KUBECONFIG }}
+      run: |
+        echo "$KUBECONFIG" > kubeconfig.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/green/trading-service-deployment.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/green/wallet-service-deployment.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/green/account-service-deployment.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/green/api-gateway-deployment.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/green/notification-service-deployment.yaml
+
+    - name: Wait for rollouts
+      run: |
+        kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/trading-service -n green
+        kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/wallet-service -n green
+        kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/account-service -n green
+        kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/api-gateway -n green
+        kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/notification-service -n green
+
+    - name: Run unit tests
+      run: |
+        services=("api-gateway" "trading-service" "wallet-service" "account-service" "notification-service")
+        for service in "${services[@]}"; do
+          cd $service
+          pip install -r requirements.txt
+          pytest
+          cd .. 
+        done
+
+    - name: Run migrations
+      run: |
+        services=("trading-service" "wallet-service" "account-service" "notification-service")
+        for service in "${services[@]}"; do
+          cd $service
+          flyway migrate -url=jdbc:mysql://$DB_HOST:$DB_PORT/$DB_NAME -user=$DB_USER -password=$DB_PASSWORD
+          cd ..
+        done
+
+    - name: Integration Testing
+      run: |
+        curl -f http://api-gateway/health || exit 1
+        curl -f http://trading-service/health || exit 1
+        curl -f http://wallet-service/health || exit 1
+        curl -f http://account-service/health || exit 1
+        curl -f http://notification-service/health || exit 1
+
+    - name: Switch Traffic to Green
+      env:
+        KUBECONFIG: ${{ secrets.KUBECONFIG }}
+      run: |
+        kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/service.yaml # Update Service to point to Green
+        kubectl --kubeconfig=kubeconfig.yaml delete namespace blue # Optional: clean up Blue namespace
+
+    - name: Clean up
+      run: |
+        rm -f kubeconfig.yaml
